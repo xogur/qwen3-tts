@@ -19,20 +19,19 @@ classifiers = [
 license = { text = "Apache-2.0" }
 authors = [{ name = "Alibaba Qwen Team" }]
 
-# 실무 현업 기준 최적화 적용 완료
 dependencies = [
   "transformers==4.57.3",
   "accelerate==1.12.0",
   "gradio",
   "librosa",
-  "torchaudio",
+  # "torchaudio",
   "soundfile",
   "sox",
-  "onnxruntime-gpu",  # CPU 전용 병목 제거 -> RTX 5090 가속 전용으로 변경
+  "onnxruntime-gpu",
   "einops",
-  "fastapi",          # API 서버 구동 필수 의존성 추가
-  "uvicorn",          # API 서버 구동 필수 의존성 추가
-  "pydantic"          # 데이터 검증 필수 의존성 추가
+  "fastapi",
+  "uvicorn",
+  "pydantic"
 ]
 
 [project.urls]

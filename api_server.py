@@ -5,6 +5,9 @@ import io
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from queue import Queue, Empty
+from threading import Thread, Event
+import numpy as np
 
 # ------------------------------------------------------------------
 # [Optimization] CUDA 메모리 및 연산 최적화 플래그 (서버 시작 전 설정)
@@ -18,16 +21,19 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-from typing import Dict, Any, AsyncGenerator
+from typing import Dict, Any, AsyncGenerator, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 from qwen_tts import Qwen3TTSModel
+import soundfile as sf # For header generation
 
 # ------------------------------------------------------------------
 # [Lifespan] 서버 시작과 종료 시 실행될 로직 (최신 FastAPI 표준)
 # ------------------------------------------------------------------
+model = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model
@@ -72,18 +78,12 @@ async def lifespan(app: FastAPI):
         model = Qwen3TTSModel.from_pretrained(
             model_name,
             device_map="auto",
-            torch_dtype=dtype_policy,
+            dtype=dtype_policy,
             attn_implementation=attn_impl,
             trust_remote_code=True
         )
 
-        # ⚠️ torch.compile은 TTS 모델에서 성능 저하를 유발합니다.
-        # TTS는 입력 길이가 매번 달라지는데, reduce-overhead 모드의 CUDA Graphs는
-        # 동일한 입력 Shape에서만 이득이 있고, Shape이 바뀌면 매번 재컴파일됩니다.
-        # 테스트 결과: "안녕!" 317ms -> 4525ms (14배 느려짐)
-        # 따라서 torch.compile을 사용하지 않습니다.
         print("ℹ️ [Optimization] torch.compile 비활성화 (가변 입력 길이 TTS에 부적합)")
-
         print("✅ [System] 모델 로드 완료. Warmup을 시작합니다...")
 
         # Warmup: GPU 초기화 및 커널 캐싱
@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
                         text=text,
                         language="Korean",
                         speaker="Sohee",
-                        non_streaming_mode=False,  # 스트리밍 모드 (prefill 오버헤드 감소)
+                        non_streaming_mode=False,
                         max_new_tokens=1024,
                         temperature=0.7,
                         top_k=30,
@@ -122,52 +122,140 @@ class TTSRequest(BaseModel):
     speaker: str = "Sohee"
     language: str = "Korean"
 
-# 글로벌 모델 변수 초기화
-model = None
-
 # ------------------------------------------------------------------
-# [API 엔드포인트] 음성 생성
+# [API 엔드포인트] 음성 생성 (스트리밍 지원)
 # ------------------------------------------------------------------
 @app.post("/tts/generate")
 async def generate_speech(request: TTSRequest):
     if not model:
         raise HTTPException(status_code=503, detail="모델이 아직 로드되지 않았습니다.")
 
-    print(f"🗣️ [Request] 텍스트 처리 중: {request.text[:30]}...")
+    print(f"🗣️ [Request] 텍스트 처리 중 (스트리밍): {request.text[:30]}...")
 
-    try:
+    # ------------------------------------------------------------------
+    # 스트리밍 로직: Forward Hook를 사용하여 생성된 토큰을 실시간 캡처
+    # ------------------------------------------------------------------
+    token_queue = Queue()
+    stop_event = Event()
+    
+    class StreamerAbort(Exception):
+        pass
+
+    def capture_tokens_hook(module, input, output):
+        if stop_event.is_set():
+            raise StreamerAbort("Client disconnected")
+            
+        # Qwen3TTSTalkerOutputWithPast의 hidden_states[1]에 현재 스텝의 codec_ids가 포함됨
+        if output.hidden_states is not None and len(output.hidden_states) >= 2:
+            try:
+                # codec_ids: [Batch, Length, Codebooks]
+                # [Fix-1] Prefill 단계에서는 None일 수 있으므로 체크
+                if output.hidden_states[1] is not None:
+                    codec_ids = output.hidden_states[1]
+                    # CPU로 이동하여 큐에 즉시 삽입 (메인 스레드에서 디코딩)
+                    token_queue.put(codec_ids.detach().cpu())
+            except Exception as e:
+                print(f"⚠️ [Hook Error] 토큰 캡처 실패: {e}")
+
+    def audio_generator():
+        # 1. Hook 등록 (Talker 모델의 Forward Pass 감시)
+        # model.model -> Qwen3TTSForConditionalGeneration
+        # model.model.talker -> Qwen3TTSTalkerForConditionalGeneration
+        hook_handle = model.model.talker.register_forward_hook(capture_tokens_hook)
+        
+        # 2. 백그라운드 스레드에서 생성 시작
+        def run_generation():
+            try:
+                # [Optimization] inference_mode 사용
+                with torch.inference_mode():
+                    model.generate_custom_voice(
+                        text=request.text,
+                        language=request.language,
+                        speaker=request.speaker,
+                        non_streaming_mode=False, 
+                        max_new_tokens=1024,
+                        temperature=0.7,
+                        top_k=30,
+                        repetition_penalty=1.1
+                    )
+            except StreamerAbort:
+                pass # 정상적인 중단
+            except Exception as e:
+                print(f"❌ [Gen Thread Error] 생성 중 오류: {e}")
+            finally:
+                token_queue.put(None) # 종료 신호
+                stop_event.set()
+
+        gen_thread = Thread(target=run_generation)
+        gen_thread.start()
+
+        # 3. 오디오 디코딩 및 전송
+        # 초기 WAV 헤더 전송 (24000Hz, 16bit Mono)
+        # 파일 크기를 알 수 없으므로 헤더만 전송하고 이후 raw PCM 데이터 전송
+        dummy_buffer = io.BytesIO()
+        sf.write(dummy_buffer, np.array([], dtype=np.int16), 24000, format='WAV', subtype='PCM_16')
+        header_bytes = dummy_buffer.getvalue()
+        yield header_bytes
+
+        accumulated_tokens = []
+        BATCH_SIZE = 5 # 5 프레임마다 디코딩 (약 200ms 지연)
         start_time = time.time()
+        first_byte_sent = False
 
-        # [Optimization] inference_mode: no_grad보다 더 적극적인 최적화
-        # CUDA Stream은 단일 순차 추론에서는 오버헤드만 추가하므로 제거
-        with torch.inference_mode():
-            wavs, sr = model.generate_custom_voice(
-                text=request.text,
-                language=request.language,
-                speaker=request.speaker,
-                non_streaming_mode=False,  # [Optimization] 스트리밍 모드 (prefill 오버헤드 감소)
-                max_new_tokens=1024,
-                temperature=0.7,
-                top_k=30,
-                repetition_penalty=1.1
-            )
+        try:
+            while True:
+                try:
+                    # 타임아웃을 두어 교착 상태 방지
+                    token = token_queue.get(timeout=1.0)
+                except Empty:
+                    if not gen_thread.is_alive():
+                        break # 스레드가 죽었고 큐가 비었으면 종료
+                    continue
 
-        if wavs is not None and len(wavs) > 0:
-            import soundfile as sf
-            buffer = io.BytesIO()
-            sf.write(buffer, wavs[0], sr, format='WAV')
-            buffer.seek(0)
+                if token is None:
+                    break
+                
+                accumulated_tokens.append(token)
 
-            latency = (time.time() - start_time) * 1000
-            print(f"⚡ [Process] 성공 ({latency:.1f}ms)")
+                if len(accumulated_tokens) >= BATCH_SIZE:
+                    # [Batch, Time, Code] 형태로 결합
+                    codes = torch.cat(accumulated_tokens, dim=1).to(model.device)
+                    accumulated_tokens = [] # 버퍼 비우기
 
-            return StreamingResponse(buffer, media_type="audio/wav")
-        else:
-            raise HTTPException(status_code=500, detail="음성 데이터 생성 실패")
+                    # 오디오 디코딩
+                    # [Fix-2] speech_tokenizer는 model.model 안에 있음
+                    wavs, sr = model.model.speech_tokenizer.decode({"audio_codes": codes})
+                    
+                    if len(wavs) > 0:
+                        audio_chunk = wavs[0]
+                        # float32 -> int16 PCM 변환
+                        audio_int16 = (np.clip(audio_chunk, -1.0, 1.0) * 32767).astype(np.int16)
+                        yield audio_int16.tobytes()
 
-    except Exception as e:
-        print(f"❌ [Error] 처리 중 오류 발생: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+                        if not first_byte_sent:
+                            latency = (time.time() - start_time) * 1000
+                            print(f"⚡ [Stream] 첫 오디오 청크 전송 ({latency:.1f}ms)")
+                            first_byte_sent = True
+
+            # 남은 토큰 처리
+            if accumulated_tokens:
+                try:
+                    codes = torch.cat(accumulated_tokens, dim=1).to(model.device)
+                    wavs, sr = model.model.speech_tokenizer.decode({"audio_codes": codes})
+                    if len(wavs) > 0:
+                         audio_int16 = (np.clip(wavs[0], -1.0, 1.0) * 32767).astype(np.int16)
+                         yield audio_int16.tobytes()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"❌ [Stream Error] 스트리밍 루프 중 오류: {e}")
+        finally:
+            stop_event.set() # 스레드 종료 신호
+            hook_handle.remove() # 훅 제거
+            # gen_thread.join() # 대기하지 않음 (응답 즉시 종료)
+
+    return StreamingResponse(audio_generator(), media_type="audio/wav")
 
 @app.get("/health")
 async def health_check():
