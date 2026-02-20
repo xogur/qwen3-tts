@@ -16,7 +16,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 # cuDNN 벤치마크: 최적 알고리즘 자동 선택
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 # TF32 연산 활성화 (RTX 30xx 이상) - FP32 대비 최대 2배 빠른 matmul
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -149,7 +149,7 @@ async def generate_speech(request: TTSRequest):
         if output.hidden_states is not None and len(output.hidden_states) >= 2:
             try:
                 # codec_ids: [Batch, Length, Codebooks]
-                # [Fix-1] Prefill 단계에서는 None일 수 있으므로 체크
+                # Prefill 단계에서는 None일 수 있으므로 체크
                 if output.hidden_states[1] is not None:
                     codec_ids = output.hidden_states[1]
                     # CPU로 이동하여 큐에 즉시 삽입 (메인 스레드에서 디코딩)
@@ -215,6 +215,12 @@ async def generate_speech(request: TTSRequest):
                 if token is None:
                     break
                 
+                # [Fix-3] 토큰 차원 확인 및 조정
+                # token shape: [Batch, Codes] (2D) -> [Batch, 1, Codes] (3D)로 변환 필요
+                # 그래야 cat(dim=1) 했을 때 [Batch, Time, Codes]가 됨
+                if token.dim() == 2:
+                    token = token.unsqueeze(1)
+                
                 accumulated_tokens.append(token)
 
                 if len(accumulated_tokens) >= BATCH_SIZE:
@@ -223,7 +229,7 @@ async def generate_speech(request: TTSRequest):
                     accumulated_tokens = [] # 버퍼 비우기
 
                     # 오디오 디코딩
-                    # [Fix-2] speech_tokenizer는 model.model 안에 있음
+                    # speech_tokenizer는 model.model 안에 있음
                     wavs, sr = model.model.speech_tokenizer.decode({"audio_codes": codes})
                     
                     if len(wavs) > 0:
