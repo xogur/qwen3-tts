@@ -73,7 +73,9 @@ async def lifespan(app: FastAPI):
     try:
         # 모델 로드
         # [Optimization] 0.6B 경량 모델 사용 (1.7B 대비 2~3배 빠른 추론)
-        model_name = os.getenv("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+        # [Upgrade] 연기 지시(instruct) 지원을 위해 1.7B CustomVoice 모델 사용
+        # 0.6B 모델은 코드상 instruct 파라미터를 강제로 무시하므로 반드시 1.7B 이상 필요
+        model_name = os.getenv("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
         print(f"📦 [System] 모델 로딩: {model_name}")
         model = Qwen3TTSModel.from_pretrained(
             model_name,
@@ -88,15 +90,19 @@ async def lifespan(app: FastAPI):
 
         # Warmup: GPU 초기화 및 커널 캐싱
         try:
-            print("🔥 [System] Warmup 2회 실행 중...")
-            warmup_texts = ["안녕하세요.", "오늘 날씨가 좋네요."]
-            for i, text in enumerate(warmup_texts):
-                print(f"  - Warmup {i+1}/{len(warmup_texts)}...")
+            print("🔥 [System] Warmup 2회 실행 중 (1.7B 모델)...")
+            warmup_tasks = [
+                {"text": "안녕하세요.", "instruct": None},
+                {"text": "오늘 날씨가 좋네요.", "instruct": "따뜻하고 다정한 목소리로 말해줘."},
+            ]
+            for i, task in enumerate(warmup_tasks):
+                print(f"  - Warmup {i+1}/{len(warmup_tasks)}... (instruct={bool(task['instruct'])})")
                 with torch.inference_mode():
                     model.generate_custom_voice(
-                        text=text,
+                        text=task["text"],
                         language="Korean",
-                        speaker="Sohee",
+                        speaker="Ono_Anna",
+                        instruct=task["instruct"],
                         non_streaming_mode=False,
                         max_new_tokens=1024,
                         temperature=0.7,
@@ -119,8 +125,9 @@ app = FastAPI(title="Qwen3-TTS API Service", lifespan=lifespan)
 
 class TTSRequest(BaseModel):
     text: str
-    speaker: str = "Sohee"
+    speaker: str = "Ono_Anna"
     language: str = "Korean"
+    instruct: Optional[str] = None  # 연기 지시 프롬프트 (예: "차분하고 따뜻하게 위로하는 목소리로 말해줘.")
 
 # ------------------------------------------------------------------
 # [API 엔드포인트] 음성 생성 (스트리밍 지원)
@@ -130,7 +137,8 @@ async def generate_speech(request: TTSRequest):
     if not model:
         raise HTTPException(status_code=503, detail="모델이 아직 로드되지 않았습니다.")
 
-    print(f"🗣️ [Request] 텍스트 처리 중 (스트리밍): {request.text[:30]}...")
+    instruct_preview = f" | instruct: '{request.instruct[:30]}...'" if request.instruct else ""
+    print(f"🗣️ [Request] 텍스트 처리 중 (스트리밍): {request.text[:30]}...{instruct_preview}")
 
     # ------------------------------------------------------------------
     # 스트리밍 로직: Forward Hook를 사용하여 생성된 토큰을 실시간 캡처
@@ -172,7 +180,8 @@ async def generate_speech(request: TTSRequest):
                         text=request.text,
                         language=request.language,
                         speaker=request.speaker,
-                        non_streaming_mode=False, 
+                        instruct=request.instruct,  # 연기 지시 프롬프트 (None이면 기본 스타일)
+                        non_streaming_mode=False,
                         max_new_tokens=1024,
                         temperature=0.7,
                         top_k=30,
@@ -190,17 +199,14 @@ async def generate_speech(request: TTSRequest):
         gen_thread.start()
 
         # 3. 오디오 디코딩 및 전송
-        # 초기 WAV 헤더 전송 (24000Hz, 16bit Mono)
-        # 파일 크기를 알 수 없으므로 헤더만 전송하고 이후 raw PCM 데이터 전송
-        dummy_buffer = io.BytesIO()
-        sf.write(dummy_buffer, np.array([], dtype=np.int16), 24000, format='WAV', subtype='PCM_16')
-        header_bytes = dummy_buffer.getvalue()
-        yield header_bytes
+        # 팝핑 이슈 해결을 위해 WAV 헤더 전송을 제거하고,
+        # 누적 디코딩 및 Overlap-Save 방식 도입
 
         accumulated_tokens = []
-        BATCH_SIZE = 5 # 5 프레임마다 디코딩 (약 200ms 지연)
+        BATCH_SIZE = 3 # [최적화] 3 프레임마다 디코딩 - 1.7B 모델의 지연을 최소화하기 위해 줄임
         start_time = time.time()
         first_byte_sent = False
+        yielded_samples = 0
 
         try:
             while True:
@@ -223,36 +229,49 @@ async def generate_speech(request: TTSRequest):
                 
                 accumulated_tokens.append(token)
 
-                if len(accumulated_tokens) >= BATCH_SIZE:
-                    # [Batch, Time, Code] 형태로 결합
+                if len(accumulated_tokens) % BATCH_SIZE == 0 and len(accumulated_tokens) > 0:
+                    # [Batch, Time, Code] 형태로 결합 (문맥 유지를 위해 누적)
                     codes = torch.cat(accumulated_tokens, dim=1).to(model.device)
-                    accumulated_tokens = [] # 버퍼 비우기
 
                     # 오디오 디코딩
                     # speech_tokenizer는 model.model 안에 있음
                     wavs, sr = model.model.speech_tokenizer.decode({"audio_codes": codes})
                     
                     if len(wavs) > 0:
-                        audio_chunk = wavs[0]
+                        # wavs[0] is already a numpy array, no need for detach().cpu().numpy()
+                        audio_chunk = wavs[0].flatten()
                         # float32 -> int16 PCM 변환
                         audio_int16 = (np.clip(audio_chunk, -1.0, 1.0) * 32767).astype(np.int16)
-                        yield audio_int16.tobytes()
+                        
+                        # 보코더 패딩 왜곡을 막기 위해 뒷부분 1토큰(약 2000샘플)은 스트리밍 보류(Overlap-Save)
+                        safe_end = max(0, len(audio_int16) - 2000)
+                        
+                        if safe_end > yielded_samples:
+                            new_samples = audio_int16[yielded_samples:safe_end]
+                            if len(new_samples) > 0:
+                                yield new_samples.tobytes()
+                            yielded_samples = safe_end
 
-                        if not first_byte_sent:
+                        if not first_byte_sent and yielded_samples > 0:
                             latency = (time.time() - start_time) * 1000
                             print(f"⚡ [Stream] 첫 오디오 청크 전송 ({latency:.1f}ms)")
                             first_byte_sent = True
 
-            # 남은 토큰 처리
+            # 남은 토큰 및 보류된 오디오 처리 (모든 스트리밍 종료 시)
             if accumulated_tokens:
                 try:
                     codes = torch.cat(accumulated_tokens, dim=1).to(model.device)
                     wavs, sr = model.model.speech_tokenizer.decode({"audio_codes": codes})
                     if len(wavs) > 0:
-                         audio_int16 = (np.clip(wavs[0], -1.0, 1.0) * 32767).astype(np.int16)
-                         yield audio_int16.tobytes()
-                except Exception:
-                    pass
+                        audio_chunk = wavs[0].flatten()
+                        audio_int16 = (np.clip(audio_chunk, -1.0, 1.0) * 32767).astype(np.int16)
+                        
+                        if len(audio_int16) > yielded_samples:
+                            new_samples = audio_int16[yielded_samples:]
+                            if len(new_samples) > 0:
+                                yield new_samples.tobytes()
+                except Exception as e:
+                    print(f"❌ [Stream Error] 남은 토큰 디코딩 실패: {e}")
 
         except Exception as e:
             print(f"❌ [Stream Error] 스트리밍 루프 중 오류: {e}")
@@ -271,4 +290,4 @@ async def health_check():
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=18003)
+    uvicorn.run("api_server:app", host="0.0.0.0", port=18003, workers=4)
