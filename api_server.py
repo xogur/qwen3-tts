@@ -15,7 +15,7 @@ import numpy as np
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
-# cuDNN 벤치마크: 최적 알고리즘 자동 선택
+# cuDNN 벤치마크: 최적 알고리즘 자동 선택 1
 torch.backends.cudnn.benchmark = False
 # TF32 연산 활성화 (RTX 30xx 이상) - FP32 대비 최대 2배 빠른 matmul
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -101,7 +101,7 @@ async def lifespan(app: FastAPI):
                     model.generate_custom_voice(
                         text=task["text"],
                         language="Korean",
-                        speaker="Ono_Anna",
+                        speaker="Serena",
                         instruct=task["instruct"],
                         non_streaming_mode=False,
                         max_new_tokens=1024,
@@ -125,7 +125,7 @@ app = FastAPI(title="Qwen3-TTS API Service", lifespan=lifespan)
 
 class TTSRequest(BaseModel):
     text: str
-    speaker: str = "Ono_Anna"
+    speaker: str = "Serena"
     language: str = "Korean"
     instruct: Optional[str] = None  # 연기 지시 프롬프트 (예: "차분하고 따뜻하게 위로하는 목소리로 말해줘.")
 
