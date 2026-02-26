@@ -101,7 +101,7 @@ async def lifespan(app: FastAPI):
                     model.generate_custom_voice(
                         text=task["text"],
                         language="Korean",
-                        speaker="Serena",
+                        speaker="Ryan",
                         instruct=task["instruct"],
                         non_streaming_mode=False,
                         max_new_tokens=1024,
@@ -125,9 +125,9 @@ app = FastAPI(title="Qwen3-TTS API Service", lifespan=lifespan)
 
 class TTSRequest(BaseModel):
     text: str
-    speaker: str = "Serena"
+    speaker: str = "Ryan"
     language: str = "Korean"
-    instruct: Optional[str] = None  # 연기 지시 프롬프트 (예: "차분하고 따뜻하게 위로하는 목소리로 말해줘.")
+    instruct: Optional[str] = None  # 연기 지시 프롬프트 (None일 경우 화자의 기본 목소리 사용)
 
 # ------------------------------------------------------------------
 # [API 엔드포인트] 음성 생성 (스트리밍 지원)
@@ -188,9 +188,15 @@ async def generate_speech(request: TTSRequest):
                         repetition_penalty=1.1
                     )
             except StreamerAbort:
-                pass # 정상적인 중단
+                pass # 정상적인 중단 (직접 잡힌 경우)
             except Exception as e:
-                print(f"❌ [Gen Thread Error] 생성 중 오류: {e}")
+                err_str = str(e)
+                # StreamerAbort가 모델 내부에서 다른 예외로 래핑될 수 있음
+                # 이 경우는 클라이언트 연결 해제로 인한 정상적인 중단이므로 WARNING으로 처리
+                if "Client disconnected" in err_str or "StreamerAbort" in err_str:
+                    print(f"⚠️ [Gen Thread] Client disconnected (정상 중단): {err_str[:80]}")
+                else:
+                    print(f"❌ [Gen Thread Error] 생성 중 오류: {e}")
             finally:
                 token_queue.put(None) # 종료 신호
                 stop_event.set()
@@ -278,7 +284,9 @@ async def generate_speech(request: TTSRequest):
         finally:
             stop_event.set() # 스레드 종료 신호
             hook_handle.remove() # 훅 제거
-            # gen_thread.join() # 대기하지 않음 (응답 즉시 종료)
+            # gen_thread가 완전히 종료될 때까지 짧게 기다려 레이스 컨디션 방지
+            # timeout을 두어 응답 지연은 최소화
+            gen_thread.join(timeout=2.0)
 
     return StreamingResponse(audio_generator(), media_type="audio/wav")
 
