@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from queue import Queue, Empty
 from threading import Thread, Event
 import numpy as np
-
+import uuid
 # ------------------------------------------------------------------
 # [Optimization] CUDA 메모리 및 연산 최적화 플래그 (서버 시작 전 설정)
 # ------------------------------------------------------------------
@@ -101,7 +101,7 @@ async def lifespan(app: FastAPI):
                     model.generate_custom_voice(
                         text=task["text"],
                         language="Korean",
-                        speaker="Ryan",
+                        speaker="Sohee",
                         instruct=task["instruct"],
                         non_streaming_mode=False,
                         max_new_tokens=1024,
@@ -137,8 +137,9 @@ async def generate_speech(request: TTSRequest):
     if not model:
         raise HTTPException(status_code=503, detail="모델이 아직 로드되지 않았습니다.")
 
+    req_id = uuid.uuid4().hex[:8]
     instruct_preview = f" | instruct: '{request.instruct[:30]}...'" if request.instruct else ""
-    print(f"🗣️ [Request] 텍스트 처리 중 (스트리밍): {request.text[:30]}...{instruct_preview}")
+    print(f"🗣️ [Request:{req_id}] 텍스트 처리 중 (스트리밍): {request.text[:30]}...{instruct_preview}")
 
     # ------------------------------------------------------------------
     # 스트리밍 로직: Forward Hook를 사용하여 생성된 토큰을 실시간 캡처
@@ -194,9 +195,11 @@ async def generate_speech(request: TTSRequest):
                 # StreamerAbort가 모델 내부에서 다른 예외로 래핑될 수 있음
                 # 이 경우는 클라이언트 연결 해제로 인한 정상적인 중단이므로 WARNING으로 처리
                 if "Client disconnected" in err_str or "StreamerAbort" in err_str:
-                    print(f"⚠️ [Gen Thread] Client disconnected (정상 중단): {err_str[:80]}")
+                    elapsed = time.time() - start_time
+                    current_yielded = yielded_samples[0]
+                    print(f"⚠️ [Gen Thread:{req_id}] Client disconnected (정상 중단). 진행: {current_yielded} samples, 소요: {elapsed:.2f}s, 텍스트: '{request.text[:50]}...'. 원인: {err_str[:80]}")
                 else:
-                    print(f"❌ [Gen Thread Error] 생성 중 오류: {e}")
+                    print(f"❌ [Gen Thread Error:{req_id}] 생성 중 오류: {e}")
             finally:
                 token_queue.put(None) # 종료 신호
                 stop_event.set()
@@ -212,7 +215,7 @@ async def generate_speech(request: TTSRequest):
         BATCH_SIZE = 3 # [최적화] 3 프레임마다 디코딩 - 1.7B 모델의 지연을 최소화하기 위해 줄임
         start_time = time.time()
         first_byte_sent = False
-        yielded_samples = 0
+        yielded_samples = [0] # List for mutability in nested thread
 
         try:
             while True:
@@ -252,15 +255,15 @@ async def generate_speech(request: TTSRequest):
                         # 보코더 패딩 왜곡을 막기 위해 뒷부분 1토큰(약 2000샘플)은 스트리밍 보류(Overlap-Save)
                         safe_end = max(0, len(audio_int16) - 2000)
                         
-                        if safe_end > yielded_samples:
-                            new_samples = audio_int16[yielded_samples:safe_end]
+                        if safe_end > yielded_samples[0]:
+                            new_samples = audio_int16[yielded_samples[0]:safe_end]
                             if len(new_samples) > 0:
                                 yield new_samples.tobytes()
-                            yielded_samples = safe_end
+                            yielded_samples[0] = safe_end
 
-                        if not first_byte_sent and yielded_samples > 0:
+                        if not first_byte_sent and yielded_samples[0] > 0:
                             latency = (time.time() - start_time) * 1000
-                            print(f"⚡ [Stream] 첫 오디오 청크 전송 ({latency:.1f}ms)")
+                            print(f"⚡ [Stream:{req_id}] 첫 오디오 청크 전송 ({latency:.1f}ms)")
                             first_byte_sent = True
 
             # 남은 토큰 및 보류된 오디오 처리 (모든 스트리밍 종료 시)
@@ -272,15 +275,15 @@ async def generate_speech(request: TTSRequest):
                         audio_chunk = wavs[0].flatten()
                         audio_int16 = (np.clip(audio_chunk, -1.0, 1.0) * 32767).astype(np.int16)
                         
-                        if len(audio_int16) > yielded_samples:
-                            new_samples = audio_int16[yielded_samples:]
+                        if len(audio_int16) > yielded_samples[0]:
+                            new_samples = audio_int16[yielded_samples[0]:]
                             if len(new_samples) > 0:
                                 yield new_samples.tobytes()
                 except Exception as e:
-                    print(f"❌ [Stream Error] 남은 토큰 디코딩 실패: {e}")
+                    print(f"❌ [Stream Error:{req_id}] 남은 토큰 디코딩 실패: {e}")
 
         except Exception as e:
-            print(f"❌ [Stream Error] 스트리밍 루프 중 오류: {e}")
+            print(f"❌ [Stream Error:{req_id}] 스트리밍 루프 중 오류: {e}")
         finally:
             stop_event.set() # 스레드 종료 신호
             hook_handle.remove() # 훅 제거
