@@ -33,6 +33,14 @@ import soundfile as sf # For header generation
 # [Lifespan] 서버 시작과 종료 시 실행될 로직 (최신 FastAPI 표준)
 # ------------------------------------------------------------------
 model = None
+logger = logging.getLogger("qwen3_tts_api")
+
+ENGLISH_DEFAULT_SPEAKER = os.getenv("QWEN3_EN_DEFAULT_SPEAKER", "Sohee")
+ENGLISH_ALLOWED_SPEAKERS = {
+    speaker.strip().lower(): speaker.strip()
+    for speaker in os.getenv("QWEN3_EN_ALLOWED_SPEAKERS", "Sohee,Ryan,Aiden").split(",")
+    if speaker.strip()
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -128,6 +136,32 @@ class TTSRequest(BaseModel):
     speaker: str = "Ryan"
     language: str = "Korean"
     instruct: Optional[str] = None  # 연기 지시 프롬프트 (None일 경우 화자의 기본 목소리 사용)
+
+
+def _normalize_english_request(request: TTSRequest) -> TTSRequest:
+    requested_speaker = (request.speaker or "").strip()
+    fallback_speaker = ENGLISH_ALLOWED_SPEAKERS.get(
+        ENGLISH_DEFAULT_SPEAKER.lower(),
+        ENGLISH_DEFAULT_SPEAKER,
+    )
+    normalized_speaker = ENGLISH_ALLOWED_SPEAKERS.get(
+        requested_speaker.lower(),
+        fallback_speaker,
+    )
+
+    if requested_speaker and requested_speaker.lower() not in ENGLISH_ALLOWED_SPEAKERS:
+        logger.warning(
+            "[Qwen3 EN] invalid speaker '%s' -> fallback '%s'",
+            requested_speaker,
+            normalized_speaker,
+        )
+
+    return TTSRequest(
+        text=request.text,
+        speaker=normalized_speaker,
+        language="English",
+        instruct=request.instruct,
+    )
 
 # ------------------------------------------------------------------
 # [API 엔드포인트] 음성 생성 (스트리밍 지원)
@@ -292,6 +326,12 @@ async def generate_speech(request: TTSRequest):
             gen_thread.join(timeout=2.0)
 
     return StreamingResponse(audio_generator(), media_type="audio/wav")
+
+
+@app.post("/tts/generate/en")
+async def generate_english_speech(request: TTSRequest):
+    normalized_request = _normalize_english_request(request)
+    return await generate_speech(normalized_request)
 
 @app.get("/health")
 async def health_check():
