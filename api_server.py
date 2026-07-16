@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from queue import Queue, Empty
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 import numpy as np
 import uuid
 # ------------------------------------------------------------------
@@ -34,6 +34,8 @@ import soundfile as sf # For header generation
 # ------------------------------------------------------------------
 model = None
 logger = logging.getLogger("qwen3_tts_api")
+generation_lock = Lock()
+WORKER_LOCK_TIMEOUT_SECONDS = float(os.getenv("QWEN_TTS_WORKER_LOCK_TIMEOUT", "60"))
 
 ENGLISH_DEFAULT_SPEAKER = os.getenv("QWEN3_EN_DEFAULT_SPEAKER", "Sohee")
 ENGLISH_ALLOWED_SPEAKERS = {
@@ -180,6 +182,11 @@ async def generate_speech(request: TTSRequest):
     # ------------------------------------------------------------------
     token_queue = Queue()
     stop_event = Event()
+    if not generation_lock.acquire(timeout=WORKER_LOCK_TIMEOUT_SECONDS):
+        raise HTTPException(
+            status_code=429,
+            detail="TTS worker is busy. Retry shortly.",
+        )
     
     class StreamerAbort(Exception):
         pass
@@ -238,6 +245,9 @@ async def generate_speech(request: TTSRequest):
                 token_queue.put(None) # 종료 신호
                 stop_event.set()
 
+        start_time = time.time()
+        yielded_samples = [0] # List for mutability in nested thread
+
         gen_thread = Thread(target=run_generation)
         gen_thread.start()
 
@@ -247,9 +257,7 @@ async def generate_speech(request: TTSRequest):
 
         accumulated_tokens = []
         BATCH_SIZE = 3 # [최적화] 3 프레임마다 디코딩 - 1.7B 모델의 지연을 최소화하기 위해 줄임
-        start_time = time.time()
         first_byte_sent = False
-        yielded_samples = [0] # List for mutability in nested thread
 
         try:
             while True:
@@ -324,6 +332,7 @@ async def generate_speech(request: TTSRequest):
             # gen_thread가 완전히 종료될 때까지 짧게 기다려 레이스 컨디션 방지
             # timeout을 두어 응답 지연은 최소화
             gen_thread.join(timeout=2.0)
+            generation_lock.release()
 
     return StreamingResponse(audio_generator(), media_type="audio/wav")
 
@@ -341,4 +350,7 @@ async def health_check():
     }
 
 if __name__ == "__main__":
-    uvicorn.run("api_server:app", host="0.0.0.0", port=18003, workers=4)
+    host = os.getenv("QWEN_TTS_HOST", "0.0.0.0")
+    port = int(os.getenv("QWEN_TTS_PORT", "18003"))
+    workers = int(os.getenv("QWEN_TTS_WORKERS", "4"))
+    uvicorn.run("api_server:app", host=host, port=port, workers=workers)
